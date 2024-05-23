@@ -5,10 +5,12 @@ const Allocator = std.mem.Allocator;
 
 pub fn Channel(comptime T: type) type {
     return struct {
-        mutex: Mutex,
-        cond: Condition,
-        queue: std.DoublyLinkedList(T),
         allocator: Allocator,
+        mutex: Mutex = .{},
+        txCond: Condition = .{}, // Optimized for many threads, rather than using broadcast to wake all threads, which could potentially waste resources.
+        rxCond: Condition = .{}, // Optimized for many threads, rather than using broadcast to wake all threads, which could potentially waste resources.
+        queue: std.DoublyLinkedList(T) = .{},
+        cap: usize,
 
         pub const Chan = @This();
 
@@ -28,25 +30,22 @@ pub fn Channel(comptime T: type) type {
             }
         };
 
-        pub fn init(allocator: Allocator) !*Chan {
+        pub fn init(allocator: Allocator, cap: usize) !*Chan {
             const chan = try allocator.create(Chan);
 
-            chan.allocator = allocator;
-            chan.mutex = .{};
-            chan.cond = .{};
-            chan.queue = .{};
+            chan.* = .{ .allocator = allocator, .cap = cap + 1 };
 
             return chan;
         }
 
         pub fn deinit(self: *Chan) void {
-            const allocator = self.allocator;
-
-            defer allocator.destroy(self);
-            defer self.* = undefined; // Set Channel instance to undefined to catch any use-after-free in debug mode.
-
             self.mutex.lock();
-            defer self.mutex.unlock();
+            const allocator = self.allocator;
+            defer {
+                self.mutex.unlock();
+                self.* = undefined; // Set Channel instance to undefined to catch any use-after-free in debug mode.
+                allocator.destroy(self);
+            }
 
             while (self.queue.popFirst()) |node| {
                 self.allocator.destroy(node);
@@ -65,8 +64,10 @@ pub fn Channel(comptime T: type) type {
             self.mutex.lock();
             defer {
                 self.mutex.unlock();
-                self.cond.signal();
+                self.rxCond.signal();
             }
+
+            while (self.queue.len >= self.cap) self.txCond.wait(&self.mutex);
 
             const node = try self.allocator.create(std.DoublyLinkedList(T).Node);
             node.data = data;
@@ -76,13 +77,16 @@ pub fn Channel(comptime T: type) type {
 
         pub fn take(self: *Chan) T {
             self.mutex.lock();
+            defer {
+                self.mutex.unlock();
+                self.txCond.signal();
+            }
+
             while (true) {
                 const node = self.queue.popFirst() orelse {
-                    self.cond.wait(&self.mutex);
+                    self.rxCond.wait(&self.mutex);
                     continue;
                 };
-
-                self.mutex.unlock();
                 defer self.allocator.destroy(node);
 
                 return node.data;
