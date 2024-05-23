@@ -40,7 +40,9 @@ pub fn Channel(comptime T: type) type {
         }
 
         pub fn deinit(self: *Chan) void {
-            defer self.allocator.destroy(self);
+            const allocator = self.allocator;
+
+            defer allocator.destroy(self);
             defer self.* = undefined; // Set Channel instance to undefined to catch any use-after-free in debug mode.
 
             self.mutex.lock();
